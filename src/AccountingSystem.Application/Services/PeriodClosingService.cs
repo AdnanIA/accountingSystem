@@ -62,14 +62,19 @@ public class PeriodClosingService : IPeriodClosingService
 
         var periodIds = year.Periods.Select(p => p.Id).ToList();
 
-        var pnlAccountBalances = await _db.JournalEntryLines
+        // Aggregated client-side: SQLite's EF Core provider cannot translate decimal Sum() into SQL.
+        var pnlLines = await _db.JournalEntryLines
             .Where(l => l.JournalEntry.CompanyId == companyId
                 && periodIds.Contains(l.JournalEntry.FiscalPeriodId)
                 && l.JournalEntry.Status == JournalEntryStatus.Posted
                 && (l.Account.Type == AccountType.Revenue || l.Account.Type == AccountType.Expense))
-            .GroupBy(l => new { l.AccountId, l.Account.Type })
-            .Select(g => new { g.Key.AccountId, g.Key.Type, Debit = g.Sum(x => x.Debit), Credit = g.Sum(x => x.Credit) })
+            .Select(l => new { l.AccountId, l.Account.Type, l.Debit, l.Credit })
             .ToListAsync(ct);
+
+        var pnlAccountBalances = pnlLines
+            .GroupBy(l => new { l.AccountId, l.Type })
+            .Select(g => new { g.Key.AccountId, g.Key.Type, Debit = g.Sum(x => x.Debit), Credit = g.Sum(x => x.Credit) })
+            .ToList();
 
         var retainedEarningsId = await _systemAccounts.ResolveAsync(companyId, SystemAccountKeys.RetainedEarnings, ct);
         var lines = new List<JournalEntryLine>();

@@ -19,47 +19,65 @@ public interface IReportingService
     Task<CashFlowReport> GetCashFlowAsync(Guid companyId, DateTime startDate, DateTime endDate, CancellationToken ct = default);
 }
 
+/// <summary>
+/// Note: all aggregation (Sum/GroupBy) below happens client-side after materializing raw line rows.
+/// SQLite's EF Core provider cannot translate decimal Sum() into SQL, and doing the aggregation in
+/// .NET keeps the same code portable to SQL Server without a provider-specific code path.
+/// </summary>
 public class ReportingService : IReportingService
 {
     private readonly IApplicationDbContext _db;
 
     public ReportingService(IApplicationDbContext db) => _db = db;
 
+    private record LineRow(Guid AccountId, string Code, string Name, AccountType Type, decimal Debit, decimal Credit);
+
+    private async Task<List<LineRow>> GetPostedLinesAsync(Guid companyId, DateTime? fromDate, DateTime toDate, CancellationToken ct)
+    {
+        var query = _db.JournalEntryLines
+            .Where(l => l.JournalEntry.CompanyId == companyId && l.JournalEntry.Status == JournalEntryStatus.Posted && l.JournalEntry.EntryDate <= toDate);
+
+        if (fromDate.HasValue)
+            query = query.Where(l => l.JournalEntry.EntryDate >= fromDate.Value);
+
+        return await query
+            .Select(l => new LineRow(l.AccountId, l.Account.Code, l.Account.Name, l.Account.Type, l.Debit, l.Credit))
+            .ToListAsync(ct);
+    }
+
     public async Task<TrialBalanceReport> GetTrialBalanceAsync(Guid companyId, DateTime asOfDate, CancellationToken ct = default)
     {
-        var balances = await _db.JournalEntryLines
-            .Where(l => l.JournalEntry.CompanyId == companyId && l.JournalEntry.Status == JournalEntryStatus.Posted && l.JournalEntry.EntryDate <= asOfDate)
-            .GroupBy(l => new { l.AccountId, l.Account.Code, l.Account.Name, l.Account.Type })
-            .Select(g => new { g.Key.AccountId, g.Key.Code, g.Key.Name, g.Key.Type, Debit = g.Sum(x => x.Debit), Credit = g.Sum(x => x.Credit) })
-            .OrderBy(g => g.Code)
-            .ToListAsync(ct);
+        var lines = await GetPostedLinesAsync(companyId, null, asOfDate, ct);
 
-        var rows = balances.Select(b =>
-        {
-            var net = b.Debit - b.Credit;
-            return net >= 0
-                ? new TrialBalanceRow(b.AccountId, b.Code, b.Name, b.Type.ToString(), net, 0)
-                : new TrialBalanceRow(b.AccountId, b.Code, b.Name, b.Type.ToString(), 0, -net);
-        }).ToList();
+        var rows = lines.GroupBy(l => new { l.AccountId, l.Code, l.Name, l.Type })
+            .Select(g =>
+            {
+                var net = g.Sum(x => x.Debit) - g.Sum(x => x.Credit);
+                return net >= 0
+                    ? new TrialBalanceRow(g.Key.AccountId, g.Key.Code, g.Key.Name, g.Key.Type.ToString(), net, 0)
+                    : new TrialBalanceRow(g.Key.AccountId, g.Key.Code, g.Key.Name, g.Key.Type.ToString(), 0, -net);
+            })
+            .OrderBy(r => r.AccountCode)
+            .ToList();
 
         return new TrialBalanceReport(asOfDate, rows, rows.Sum(r => r.Debit), rows.Sum(r => r.Credit));
     }
 
     public async Task<IncomeStatementReport> GetIncomeStatementAsync(Guid companyId, DateTime startDate, DateTime endDate, CancellationToken ct = default)
     {
-        var balances = await _db.JournalEntryLines
-            .Where(l => l.JournalEntry.CompanyId == companyId && l.JournalEntry.Status == JournalEntryStatus.Posted
-                && l.JournalEntry.EntryDate >= startDate && l.JournalEntry.EntryDate <= endDate
-                && (l.Account.Type == AccountType.Revenue || l.Account.Type == AccountType.Expense))
-            .GroupBy(l => new { l.Account.Code, l.Account.Name, l.Account.Type })
-            .Select(g => new { g.Key.Code, g.Key.Name, g.Key.Type, Debit = g.Sum(x => x.Debit), Credit = g.Sum(x => x.Credit) })
-            .OrderBy(g => g.Code)
-            .ToListAsync(ct);
+        var lines = (await GetPostedLinesAsync(companyId, startDate, endDate, ct))
+            .Where(l => l.Type is AccountType.Revenue or AccountType.Expense)
+            .ToList();
 
-        var revenues = balances.Where(b => b.Type == AccountType.Revenue)
-            .Select(b => new IncomeStatementRow(b.Code, b.Name, b.Credit - b.Debit)).ToList();
-        var expenses = balances.Where(b => b.Type == AccountType.Expense)
-            .Select(b => new IncomeStatementRow(b.Code, b.Name, b.Debit - b.Credit)).ToList();
+        var revenues = lines.Where(l => l.Type == AccountType.Revenue)
+            .GroupBy(l => new { l.Code, l.Name })
+            .Select(g => new IncomeStatementRow(g.Key.Code, g.Key.Name, g.Sum(x => x.Credit) - g.Sum(x => x.Debit)))
+            .OrderBy(r => r.AccountCode).ToList();
+
+        var expenses = lines.Where(l => l.Type == AccountType.Expense)
+            .GroupBy(l => new { l.Code, l.Name })
+            .Select(g => new IncomeStatementRow(g.Key.Code, g.Key.Name, g.Sum(x => x.Debit) - g.Sum(x => x.Credit)))
+            .OrderBy(r => r.AccountCode).ToList();
 
         var totalRevenue = revenues.Sum(r => r.Amount);
         var totalExpense = expenses.Sum(r => r.Amount);
@@ -69,23 +87,20 @@ public class ReportingService : IReportingService
 
     public async Task<BalanceSheetReport> GetBalanceSheetAsync(Guid companyId, DateTime asOfDate, CancellationToken ct = default)
     {
-        var balances = await _db.JournalEntryLines
-            .Where(l => l.JournalEntry.CompanyId == companyId && l.JournalEntry.Status == JournalEntryStatus.Posted && l.JournalEntry.EntryDate <= asOfDate)
-            .GroupBy(l => new { l.Account.Code, l.Account.Name, l.Account.Type })
-            .Select(g => new { g.Key.Code, g.Key.Name, g.Key.Type, Debit = g.Sum(x => x.Debit), Credit = g.Sum(x => x.Credit) })
-            .OrderBy(g => g.Code)
-            .ToListAsync(ct);
+        var lines = await GetPostedLinesAsync(companyId, null, asOfDate, ct);
 
-        var assets = balances.Where(b => b.Type == AccountType.Asset)
-            .Select(b => new BalanceSheetRow(b.Code, b.Name, b.Debit - b.Credit)).ToList();
-        var liabilities = balances.Where(b => b.Type == AccountType.Liability)
-            .Select(b => new BalanceSheetRow(b.Code, b.Name, b.Credit - b.Debit)).ToList();
-        var equity = balances.Where(b => b.Type == AccountType.Equity)
-            .Select(b => new BalanceSheetRow(b.Code, b.Name, b.Credit - b.Debit)).ToList();
+        List<BalanceSheetRow> RowsFor(AccountType type, bool creditNormal) =>
+            lines.Where(l => l.Type == type)
+                .GroupBy(l => new { l.Code, l.Name })
+                .Select(g => new BalanceSheetRow(g.Key.Code, g.Key.Name, creditNormal ? g.Sum(x => x.Credit) - g.Sum(x => x.Debit) : g.Sum(x => x.Debit) - g.Sum(x => x.Credit)))
+                .OrderBy(r => r.AccountCode).ToList();
 
-        var revenueExpense = balances.Where(b => b.Type is AccountType.Revenue or AccountType.Expense).ToList();
-        var netIncomeYtd = revenueExpense.Where(b => b.Type == AccountType.Revenue).Sum(b => b.Credit - b.Debit)
-            - revenueExpense.Where(b => b.Type == AccountType.Expense).Sum(b => b.Debit - b.Credit);
+        var assets = RowsFor(AccountType.Asset, creditNormal: false);
+        var liabilities = RowsFor(AccountType.Liability, creditNormal: true);
+        var equity = RowsFor(AccountType.Equity, creditNormal: true);
+
+        var netIncomeYtd = lines.Where(l => l.Type == AccountType.Revenue).Sum(l => l.Credit - l.Debit)
+            - lines.Where(l => l.Type == AccountType.Expense).Sum(l => l.Debit - l.Credit);
 
         var totalAssets = assets.Sum(a => a.Amount);
         var totalLiabilities = liabilities.Sum(l => l.Amount);
@@ -100,9 +115,11 @@ public class ReportingService : IReportingService
         var account = await _db.Accounts.FirstOrDefaultAsync(a => a.Id == accountId && a.CompanyId == companyId, ct)
             ?? throw new DomainException("Account not found.");
 
-        var openingMovement = await _db.JournalEntryLines
+        var priorLines = await _db.JournalEntryLines
             .Where(l => l.AccountId == accountId && l.JournalEntry.Status == JournalEntryStatus.Posted && l.JournalEntry.EntryDate < startDate)
-            .SumAsync(l => l.Debit - l.Credit, ct);
+            .Select(l => new { l.Debit, l.Credit })
+            .ToListAsync(ct);
+        var openingMovement = priorLines.Sum(l => l.Debit - l.Credit);
 
         var openingBalance = account.NormalBalance == NormalBalance.Debit ? openingMovement : -openingMovement;
 
@@ -151,9 +168,11 @@ public class ReportingService : IReportingService
     {
         var incomeStatement = await GetIncomeStatementAsync(companyId, startDate, endDate, ct);
 
-        var depreciation = await _db.DepreciationEntries
+        var depreciationEntries = await _db.DepreciationEntries
             .Where(d => d.PeriodDate >= startDate && d.PeriodDate <= endDate && d.FixedAsset.CompanyId == companyId)
-            .SumAsync(d => d.Amount, ct);
+            .Select(d => d.Amount)
+            .ToListAsync(ct);
+        var depreciation = depreciationEntries.Sum();
 
         var arAccountId = await _db.Accounts.Where(a => a.CompanyId == companyId && a.SystemAccountKey == SystemAccountKeys.AccountsReceivable).Select(a => a.Id).FirstOrDefaultAsync(ct);
         var apAccountId = await _db.Accounts.Where(a => a.CompanyId == companyId && a.SystemAccountKey == SystemAccountKeys.AccountsPayable).Select(a => a.Id).FirstOrDefaultAsync(ct);
@@ -185,9 +204,12 @@ public class ReportingService : IReportingService
         var ids = accountIds.Where(id => id != Guid.Empty).ToList();
         if (ids.Count == 0) return 0;
 
-        return await _db.JournalEntryLines
+        var lines = await _db.JournalEntryLines
             .Where(l => ids.Contains(l.AccountId) && l.JournalEntry.Status == JournalEntryStatus.Posted && l.JournalEntry.EntryDate <= asOfDate)
-            .SumAsync(l => l.Debit - l.Credit, ct);
+            .Select(l => new { l.Debit, l.Credit })
+            .ToListAsync(ct);
+
+        return lines.Sum(l => l.Debit - l.Credit);
     }
 
     private async Task<decimal> GetAccountsCreditBalanceAsOf(IEnumerable<Guid> accountIds, DateTime asOfDate, CancellationToken ct)
@@ -195,9 +217,12 @@ public class ReportingService : IReportingService
         var ids = accountIds.Where(id => id != Guid.Empty).ToList();
         if (ids.Count == 0) return 0;
 
-        return await _db.JournalEntryLines
+        var lines = await _db.JournalEntryLines
             .Where(l => ids.Contains(l.AccountId) && l.JournalEntry.Status == JournalEntryStatus.Posted && l.JournalEntry.EntryDate <= asOfDate)
-            .SumAsync(l => l.Credit - l.Debit, ct);
+            .Select(l => new { l.Debit, l.Credit })
+            .ToListAsync(ct);
+
+        return lines.Sum(l => l.Credit - l.Debit);
     }
 
     private static List<AgingRow> BuildAging(IEnumerable<(Guid PartyId, string Name, DateTime DueDate, decimal Balance)> items, DateTime asOfDate)
