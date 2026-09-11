@@ -1,0 +1,31 @@
+## .NET
+bin/
+obj/
+out/
+
+## Rider / VS / VS Code
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+
+## SQLite / local data
+*.db
+*.db-shm
+*.db-wal
+
+## User secrets / env
+appsettings.*.local.json
+.env
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Logs
+*.log
